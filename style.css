@@ -1,0 +1,47 @@
+:root {
+  --pt-green: #006400;
+  --pt-red: #D40000;
+  --br-green: #009B3A;
+  --br-yellow: #FFDF00;
+  --bg: #0b1020;
+  --card: #121a33;
+  --muted: #94a3b8;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, Arial, sans-serif;
+  background: linear-gradient(135deg, var(--bg), #0f172a);
+  color: #e2e8f0;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 20px;
+  background: linear-gradient(90deg, var(--pt-green), var(--br-green));
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .25);
+}
+
+.flag {
+  width: 20px;
+  height: 12px;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px #0003 inset;
+}
+.flag.br { background: linear-gradient(0deg, var(--br-green) 60%, var(--br-yellow) 60%); }
+.flag.pt { background: linear-gradient(90deg, var(--pt-green) 50%, var(--pt-red) 50%); }
+
+.container { max-width: 1080px; margin: 24px auto; padding: 0 16px; }
+.card { background: var(--card); border-radius: 18px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.2); }
+
+.button {
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  border: none;
+}
+.button.primary { background: linear-gradient(90deg, var(--br-yellow), #ffd84d); color: #0b1020; }
+.button.success { background: linear-gradient(90deg, #22c55e, #16a34a); color: white; }
