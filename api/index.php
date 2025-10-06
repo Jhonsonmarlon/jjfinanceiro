@@ -2,9 +2,9 @@
 declare(strict_types=1);
 
 /**
- * JJFinanceiro – MVP Luso-Brasileiro (Vercel + MySQL Hostinger)
- * PHP 8.1+, MariaDB/MySQL 10+
- * Sessões persistidas no DB para funcionar no serverless.
+ * JJFinanceiro – Vercel + Neon (PostgreSQL)
+ * PHP 8.1+ / PDO pgsql
+ * Lê DATABASE_URL/POSTGRES_URL da Vercel e usa sessões em tabela.
  */
 
 /////////////////////
@@ -15,12 +15,43 @@ ini_set('session.use_strict_mode', '1');
 ini_set('session.cookie_httponly', '1');
 ini_set('session.use_only_cookies', '1');
 
-$DB_DSN  = $_ENV['DB_DSN']  ?? getenv('DB_DSN')  ?? 'mysql:host=127.0.0.1;port=3306;dbname=luso_finance;charset=utf8mb4';
-$DB_USER = $_ENV['DB_USER'] ?? getenv('DB_USER') ?? 'root';
-$DB_PASS = $_ENV['DB_PASS'] ?? getenv('DB_PASS') ?? '';
+/** Constrói DSN/credenciais a partir de uma URL postgres:// */
+function pg_dsn_from_url(string $url): array {
+  $p = parse_url($url);
+  if (!$p || !isset($p['scheme']) || !str_starts_with($p['scheme'], 'postgres')) {
+    throw new RuntimeException('DATABASE_URL/POSTGRES_URL inválida.');
+  }
+  $host = $p['host'] ?? 'localhost';
+  $port = (string)($p['port'] ?? '5432');
+  $user = urldecode($p['user'] ?? '');
+  $pass = urldecode($p['pass'] ?? '');
+  $db   = ltrim($p['path'] ?? '', '/');
+  // Neon requer SSL
+  $dsn  = "pgsql:host={$host};port={$port};dbname={$db};sslmode=require";
+  return [$dsn, $user, $pass];
+}
+
+$PGURL = $_ENV['DATABASE_URL']
+      ?? $_ENV['POSTGRES_URL']
+      ?? $_ENV['POSTGRES_PRISMA_URL']
+      ?? $_ENV['POSTGRES_URL_NON_POOLING']
+      ?? $_ENV['POSTGRES_URL_NO_SSL']
+      ?? getenv('DATABASE_URL')
+      ?? getenv('POSTGRES_URL')
+      ?? '';
+
+if (!$PGURL) {
+  http_response_code(500);
+  echo 'Falta a variável de ambiente DATABASE_URL/POSTGRES_URL.';
+  exit;
+}
 
 try {
-  $pdo = new PDO($DB_DSN, $DB_USER, $DB_PASS, [
+  [$DSN,$DB_USER,$DB_PASS] = pg_dsn_from_url($PGURL);
+  if (!extension_loaded('pdo_pgsql')) {
+    throw new RuntimeException('Extensão pdo_pgsql não está carregada.');
+  }
+  $pdo = new PDO($DSN, $DB_USER, $DB_PASS, [
     PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
     PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
   ]);
@@ -30,46 +61,35 @@ try {
   exit;
 }
 
-/**
- * Session handler em PDO (tabela `sessions` será criada se não existir)
- */
+/////////////////////
+// SESSION HANDLER (tabela `sessions`)
+/////////////////////
 class PdoSessionHandler implements SessionHandlerInterface {
-  private PDO $pdo;
-  public function __construct(PDO $pdo) { $this->pdo = $pdo; $this->ensureTable(); }
-  private function ensureTable(): void {
-    $this->pdo->exec("
-      CREATE TABLE IF NOT EXISTS sessions (
-        id VARCHAR(128) PRIMARY KEY,
-        data LONGBLOB NOT NULL,
-        expires INT UNSIGNED NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        INDEX (expires)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    ");
-  }
+  public function __construct(private PDO $pdo) {}
   public function open($savePath, $sessionName): bool { return true; }
   public function close(): bool { return true; }
   public function read($id): string|false {
-    $st = $this->pdo->prepare("SELECT data FROM sessions WHERE id=? AND expires > ?");
-    $st->execute([$id, time()]);
-    $row = $st->fetch(PDO::FETCH_ASSOC);
+    $st = $this->pdo->prepare('SELECT data FROM sessions WHERE id = :id AND expires > :now');
+    $st->execute([':id'=>$id, ':now'=>time()]);
+    $row = $st->fetch();
     return $row ? (string)$row['data'] : '';
   }
   public function write($id, $data): bool {
     $exp = time() + (int)ini_get('session.gc_maxlifetime');
-    $st = $this->pdo->prepare("
-      INSERT INTO sessions (id, data, expires) VALUES(?,?,?)
-      ON DUPLICATE KEY UPDATE data=VALUES(data), expires=VALUES(expires)
-    ");
-    return $st->execute([$id, $data, $exp]);
+    $st = $this->pdo->prepare('
+      INSERT INTO sessions(id,data,expires)
+      VALUES(:i,:d,:e)
+      ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data, expires=EXCLUDED.expires
+    ');
+    return $st->execute([':i'=>$id, ':d'=>$data, ':e'=>$exp]);
   }
   public function destroy($id): bool {
-    $st = $this->pdo->prepare("DELETE FROM sessions WHERE id=?");
-    return $st->execute([$id]);
+    $st = $this->pdo->prepare('DELETE FROM sessions WHERE id=:i');
+    return $st->execute([':i'=>$id]);
   }
   public function gc($max_lifetime): int|false {
-    $st = $this->pdo->prepare("DELETE FROM sessions WHERE expires < ?");
-    $st->execute([time()]);
+    $st = $this->pdo->prepare('DELETE FROM sessions WHERE expires < :now');
+    $st->execute([':now'=>time()]);
     return $st->rowCount();
   }
 }
@@ -87,9 +107,16 @@ function get_flash(): ?array { $f = $_SESSION['flash'] ?? null; unset($_SESSION[
 function require_login(): void { if (empty($_SESSION['uid'])) { header('Location: ?page=login'); exit; } }
 function current_user(PDO $pdo): ?array {
   if (empty($_SESSION['uid'])) return null;
-  $st = $pdo->prepare('SELECT * FROM users WHERE id=?'); $st->execute([$_SESSION['uid']]);
+  $st = $pdo->prepare('SELECT * FROM users WHERE id = :id');
+  $st->execute([':id'=>$_SESSION['uid']]);
   return $st->fetch() ?: null;
 }
+
+/////////////////////
+// SEEDS CÂMBIO (EUR/BRL do dia)
+/////////////////////
+$pdo->exec("INSERT INTO currency_rates(currency_code,rate_eur,rate_date) VALUES ('EUR',1.00000000,CURRENT_DATE) ON CONFLICT (currency_code,rate_date) DO NOTHING");
+$pdo->exec("INSERT INTO currency_rates(currency_code,rate_eur,rate_date) VALUES ('BRL',0.18000000,CURRENT_DATE) ON CONFLICT (currency_code,rate_date) DO NOTHING");
 
 /////////////////////
 // ROTAS POST
@@ -106,15 +133,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     $hash = password_hash($pass, PASSWORD_DEFAULT);
     try {
-      $st=$pdo->prepare('INSERT INTO users(name,email,pass_hash) VALUES(?,?,?)');
-      $st->execute([$name,$email,$hash]);
+      $st=$pdo->prepare('INSERT INTO users(name,email,pass_hash) VALUES(:n,:e,:p)');
+      $st->execute([':n'=>$name,':e'=>$email,':p'=>$hash]);
       flash('Cadastro concluído. Faça login.'); header('Location:?page=login'); exit;
     } catch(PDOException $e){ flash('Email já cadastrado.','danger'); header('Location:?page=register'); exit; }
   }
 
   if ($page === 'login' && csrf_ok()) {
     $email=trim($_POST['email'] ?? ''); $pass=(string)($_POST['pass'] ?? '');
-    $st=$pdo->prepare('SELECT * FROM users WHERE email=?'); $st->execute([$email]); $u=$st->fetch();
+    $st=$pdo->prepare('SELECT * FROM users WHERE email = :e'); $st->execute([':e'=>$email]); $u=$st->fetch();
     if ($u && password_verify($pass, $u['pass_hash'])) { $_SESSION['uid'] = $u['id']; flash('Bem-vindo, '.$u['name'].'!'); header('Location:?page=dashboard'); exit; }
     flash('Credenciais inválidas.','danger'); header('Location:?page=login'); exit;
   }
@@ -131,21 +158,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $account = trim($_POST['account'] ?? '');
     $date = $_POST['entry_date'] ?? date('Y-m-d');
 
-    // pega taxa do dia (ou última disponível)
-    $st=$pdo->prepare('SELECT rate_eur FROM currency_rates WHERE currency_code=? AND rate_date=?');
-    $st->execute([$currency,$date]);
+    // taxa do dia (ou última existente)
+    $st=$pdo->prepare('SELECT rate_eur FROM currency_rates WHERE currency_code = :c AND rate_date = :d');
+    $st->execute([':c'=>$currency, ':d'=>$date]);
     $rate = $st->fetchColumn();
     if ($rate === false) {
-      $st=$pdo->prepare('SELECT rate_eur FROM currency_rates WHERE currency_code=? ORDER BY rate_date DESC LIMIT 1');
-      $st->execute([$currency]);
+      $st=$pdo->prepare('SELECT rate_eur FROM currency_rates WHERE currency_code = :c ORDER BY rate_date DESC LIMIT 1');
+      $st->execute([':c'=>$currency]);
       $rate = $st->fetchColumn();
       if ($rate === false) $rate = 1.0;
     }
     $amount_eur = round($amount * (float)$rate, 2);
 
-    $st=$pdo->prepare('INSERT INTO entries(user_id,kind,category,description,amount,currency_code,fx_rate_eur,amount_eur,account,entry_date) VALUES(?,?,?,?,?,?,?,?,?,?)');
-    $st->execute([$uid,$kind,$category,$description,$amount,$currency,$rate,$amount_eur,$account,$date]);
-
+    $st=$pdo->prepare('
+      INSERT INTO entries(user_id,kind,category,description,amount,currency_code,fx_rate_eur,amount_eur,account,entry_date)
+      VALUES(:u,:k,:cat,:desc,:amt,:cur,:fx,:amt_eur,:acc,:dt)
+    ');
+    $st->execute([
+      ':u'=>$uid, ':k'=>$kind, ':cat'=>$category, ':desc'=>$description,
+      ':amt'=>$amount, ':cur'=>$currency, ':fx'=>$rate, ':amt_eur'=>$amount_eur,
+      ':acc'=>$account, ':dt'=>$date
+    ]);
     flash('Lançamento registado.'); header('Location:?page=entries'); exit;
   }
 
@@ -155,8 +188,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $rate=(float)($_POST['rate_eur'] ?? 0);
     $date=$_POST['rate_date'] ?? date('Y-m-d');
     if (!$code || $rate <= 0) { flash('Informe moeda e taxa válida.','danger'); header('Location:?page=rates'); exit; }
-    $st=$pdo->prepare('INSERT INTO currency_rates(currency_code,rate_eur,rate_date) VALUES(?,?,?) ON DUPLICATE KEY UPDATE rate_eur=VALUES(rate_eur)');
-    $st->execute([$code,$rate,$date]);
+    $st=$pdo->prepare('
+      INSERT INTO currency_rates(currency_code,rate_eur,rate_date)
+      VALUES(:c,:r,:d)
+      ON CONFLICT (currency_code,rate_date) DO UPDATE SET rate_eur=EXCLUDED.rate_eur
+    ');
+    $st->execute([':c'=>$code, ':r'=>$rate, ':d'=>$date]);
     flash('Taxa de câmbio atualizada.'); header('Location:?page=rates'); exit;
   }
 
@@ -166,8 +203,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $hours=(float)($_POST['hours_worked'] ?? 0);
     $ot=(float)($_POST['overtime_hours'] ?? 0);
     $notes=trim($_POST['notes'] ?? '');
-    $st=$pdo->prepare('INSERT INTO work_logs(user_id,work_date,hours_worked,overtime_hours,notes) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE hours_worked=VALUES(hours_worked), overtime_hours=VALUES(overtime_hours), notes=VALUES(notes)');
-    $st->execute([$uid,$work_date,$hours,$ot,$notes]);
+    $st=$pdo->prepare('
+      INSERT INTO work_logs(user_id,work_date,hours_worked,overtime_hours,notes)
+      VALUES(:u,:d,:h,:o,:n)
+      ON CONFLICT (user_id,work_date) DO UPDATE
+        SET hours_worked=EXCLUDED.hours_worked,
+            overtime_hours=EXCLUDED.overtime_hours,
+            notes=EXCLUDED.notes
+    ');
+    $st->execute([':u'=>$uid, ':d'=>$work_date, ':h'=>$hours, ':o'=>$ot, ':n'=>$notes]);
     flash('Registo de horas salvo.'); header('Location:?page=salary'); exit;
   }
 
@@ -176,8 +220,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $rate=(float)($_POST['base_hour_rate'] ?? 0);
     $meal=(float)($_POST['meal_allowance_per_day'] ?? 0);
     $mult=(float)($_POST['overtime_multiplier'] ?? 1.25);
-    $st=$pdo->prepare('INSERT INTO salary_config(user_id,base_hour_rate,meal_allowance_per_day,overtime_multiplier) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE base_hour_rate=VALUES(base_hour_rate), meal_allowance_per_day=VALUES(meal_allowance_per_day), overtime_multiplier=VALUES(overtime_multiplier)');
-    $st->execute([$uid,$rate,$meal,$mult]);
+    $st=$pdo->prepare('
+      INSERT INTO salary_config(user_id,base_hour_rate,meal_allowance_per_day,overtime_multiplier)
+      VALUES(:u,:r,:m,:x)
+      ON CONFLICT (user_id) DO UPDATE
+        SET base_hour_rate=EXCLUDED.base_hour_rate,
+            meal_allowance_per_day=EXCLUDED.meal_allowance_per_day,
+            overtime_multiplier=EXCLUDED.overtime_multiplier
+    ');
+    $st->execute([':u'=>$uid, ':r'=>$rate, ':m'=>$meal, ':x'=>$mult]);
     flash('Configuração salarial atualizada.'); header('Location:?page=salary'); exit;
   }
 }
@@ -193,11 +244,9 @@ function layout(string $title, string $contentHtml): void {
   if ($flash) echo '<div style="max-width:1080px;margin:16px auto"><div style="background:#102a16;border:1px solid #1f5f30;padding:12px;border-radius:12px;color:#d1fae5">'.h($flash[0]).'</div></div>';
   echo '<div class="container">'.$contentHtml.'</div></body></html>';
 }
-
 function nav(string $active): string {
   $items = ['dashboard'=>'Painel','entries'=>'Lançamentos','rates'=>'Câmbio','salary'=>'Ordenado (PT)'];
-  $links='';
-  foreach ($items as $k=>$v) {
+  $links=''; foreach ($items as $k=>$v) {
     $cls = $k===$active ? 'active' : '';
     $links .= '<a class="'.$cls.'" href="?page='.$k.'" style="color:#cbd5e1;text-decoration:none;margin-right:10px;border:1px solid #243056;padding:8px 12px;border-radius:10px">'.h($v).'</a>';
   }
@@ -235,13 +284,13 @@ $u = current_user($pdo);
 
 if ($page === 'dashboard') {
   $month = $_GET['m'] ?? date('Y-m');
-  $st=$pdo->prepare("SELECT kind, SUM(amount_eur) v FROM entries WHERE user_id=? AND DATE_FORMAT(entry_date,'%Y-%m')=? GROUP BY kind");
-  $st->execute([$u['id'],$month]);
+  $st=$pdo->prepare("SELECT kind, SUM(amount_eur) v FROM entries WHERE user_id=:u AND to_char(entry_date,'YYYY-MM')=:m GROUP BY kind");
+  $st->execute([':u'=>$u['id'], ':m'=>$month]);
   $sum=['income'=>0,'expense'=>0,'transfer'=>0]; foreach($st as $r){ $sum[$r['kind']] = (float)$r['v']; }
   $balance = $sum['income'] - $sum['expense'];
 
-  $recent = $pdo->prepare("SELECT entry_date,kind,category,description,amount,currency_code,amount_eur FROM entries WHERE user_id=? ORDER BY entry_date DESC, id DESC LIMIT 10");
-  $recent->execute([$u['id']]);
+  $recent = $pdo->prepare("SELECT entry_date,kind,category,description,amount,currency_code,amount_eur FROM entries WHERE user_id=:u ORDER BY entry_date DESC, id DESC LIMIT 10");
+  $recent->execute([':u'=>$u['id']]);
   $rows=''; foreach($recent as $r){
     $rows.='<tr>'
       .'<td>'.h($r['entry_date']).'</td>'
@@ -265,8 +314,8 @@ if ($page === 'dashboard') {
 }
 
 if ($page === 'entries') {
-  $st=$pdo->prepare("SELECT * FROM entries WHERE user_id=? ORDER BY entry_date DESC, id DESC LIMIT 100");
-  $st->execute([$u['id']]);
+  $st=$pdo->prepare("SELECT * FROM entries WHERE user_id=:u ORDER BY entry_date DESC, id DESC LIMIT 100");
+  $st->execute([':u'=>$u['id']]);
   $rows=''; foreach($st as $r){
     $rows.='<tr>'
       .'<td>'.h($r['entry_date']).'</td>'
@@ -302,6 +351,7 @@ if ($page === 'entries') {
 if ($page === 'rates') {
   $st=$pdo->query("SELECT currency_code, rate_eur, rate_date FROM currency_rates ORDER BY rate_date DESC, currency_code");
   $rows=''; foreach($st as $r){ $rows.='<tr><td>'.h($r['currency_code']).'</td><td>'.number_format((float)$r['rate_eur'],6,',','.').'</td><td>'.h($r['rate_date']).'</td></tr>'; }
+
   $form = '<form method="post" action="?page=rate_save"><input type="hidden" name="csrf" value="'.csrf_token().'">'
     .'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">'
     .'<label>Moeda (BRL, EUR...)<br><input class="input" name="currency_code" maxlength="3" required></label>'
@@ -318,12 +368,12 @@ if ($page === 'rates') {
 }
 
 if ($page === 'salary') {
-  $st = $pdo->prepare('SELECT * FROM salary_config WHERE user_id=?'); $st->execute([$u['id']]);
+  $st = $pdo->prepare('SELECT * FROM salary_config WHERE user_id = :u'); $st->execute([':u'=>$u['id']]);
   $cfg = $st->fetch() ?: ['base_hour_rate'=>0,'meal_allowance_per_day'=>0,'overtime_multiplier'=>1.25];
 
   $month = $_GET['m'] ?? date('Y-m');
-  $wl = $pdo->prepare("SELECT SUM(hours_worked) h, SUM(overtime_hours) ot, COUNT(*) d FROM work_logs WHERE user_id=? AND DATE_FORMAT(work_date,'%Y-%m')=?");
-  $wl->execute([$u['id'],$month]);
+  $wl = $pdo->prepare("SELECT COALESCE(SUM(hours_worked),0) h, COALESCE(SUM(overtime_hours),0) ot, COUNT(*) d FROM work_logs WHERE user_id=:u AND to_char(work_date,'YYYY-MM')=:m");
+  $wl->execute([':u'=>$u['id'], ':m'=>$month]);
   $tot = $wl->fetch() ?: ['h'=>0,'ot'=>0,'d'=>0];
   $gross = ($tot['h']*$cfg['base_hour_rate']) + ($tot['ot']*$cfg['base_hour_rate']*$cfg['overtime_multiplier']);
   $meals = ((int)$tot['d']) * $cfg['meal_allowance_per_day'];
